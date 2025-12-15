@@ -17,14 +17,15 @@ package ca.uwaterloo.flix.language.phase
 
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.LoweredAst.Expr
+import ca.uwaterloo.flix.language.ast.Symbol.DefnSym
 import ca.uwaterloo.flix.language.ast.Type.eraseAliases
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.shared.*
 import ca.uwaterloo.flix.language.ast.shared.SymUse.*
 import ca.uwaterloo.flix.language.ast.{AtomicOp, Kind, LoweredAst, Name, Scheme, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.dbg.AstPrinter.DebugLoweredAst
-import ca.uwaterloo.flix.util.collection.{ListOps, Nel}
-import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
+import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListMap, ListOps, Nel}
+import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps, Result}
 
 /**
   * This phase translates AST expressions related to the Datalog subset of the
@@ -148,9 +149,10 @@ object Lowering {
   /**
     * Translates internal Datalog constraints into Flix Datalog constraints.
     */
-  def run(root: TypedAst.Root)(implicit flix: Flix): LoweredAst.Root = flix.phase("Lowering") {
+  def run(rooot: TypedAst.Root)(implicit flix: Flix): LoweredAst.Root = flix.phase("Lowering") {
+    val root = introduceTests(rooot)
     implicit val r: TypedAst.Root = root
-
+    println("I am the one who lowers")
     val defs = ParOps.parMapValues(root.defs)(visitDef)
     val sigs = ParOps.parMapValues(root.sigs)(visitSig)
     val instances = ParOps.parMapValueList(root.instances)(visitInstance)
@@ -169,6 +171,195 @@ object Lowering {
     }
 
     LoweredAst.Root(traits, instances, sigs, defs, newEnums, structs, effects, aliases, root.mainEntryPoint, root.entryPoints, root.sources, root.traitEnv, root.eqEnv)
+  }
+
+  /**
+    * Evaluates `eff` if it is well-formed and has no type variables,
+    * associated types, or error types.
+    */
+  private def eval(eff: Type): Result[CofiniteSet[Symbol.EffSym], Unit] = eff match {
+    case Type.Cst(tc, _) => tc match {
+      case TypeConstructor.Pure => Result.Ok(CofiniteSet.empty)
+      case TypeConstructor.Univ => Result.Ok(CofiniteSet.universe)
+      case TypeConstructor.Effect(sym, _) => Result.Ok(CofiniteSet.mkSet(sym))
+      case _ => Result.Err(())
+    }
+    case Type.Apply(Type.Cst(TypeConstructor.Complement, _), x0, _) =>
+      Result.mapN(eval(x0)) {
+        case x => CofiniteSet.complement(x)
+      }
+    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Union, _), x0, _), y0, _) =>
+      Result.mapN(eval(x0), eval(y0)) {
+        case (x, y) => CofiniteSet.union(x, y)
+      }
+    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Intersection, _), x0, _), y0, _) =>
+      Result.mapN(eval(x0), eval(y0)) {
+        case (x, y) => CofiniteSet.intersection(x, y)
+      }
+    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Difference, _), x0, _), y0, _) =>
+      Result.mapN(eval(x0), eval(y0)) {
+        case (x, y) => CofiniteSet.difference(x, y)
+      }
+    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SymmetricDiff, _), x0, _), y0, _) =>
+      Result.mapN(eval(x0), eval(y0)) {
+        case (x, y) => CofiniteSet.xor(x, y)
+      }
+    case Type.Alias(_, _, tpe, _) => eval(tpe)
+    case Type.Var(_, _) => Result.Err(())
+    case Type.Apply(_, _, _) => Result.Err(())
+    case Type.AssocType(_, _, _, _) => Result.Err(())
+    case Type.JvmToType(_, _) => Result.Err(())
+    case Type.JvmToEff(_, _) => Result.Err(())
+    case Type.UnresolvedJvmType(_, _) => Result.Err(())
+  }
+
+  private def createFnArg(defnSym : Symbol.DefnSym, fnEff: Type)(implicit flix: Flix) : TypedAst.Expr = {
+    val fbind = Symbol.freshVarSym("arg0", BoundBy.FormalParam, SourceLocation.Unknown)(Scope.Top, flix)
+    TypedAst.Expr.Lambda(TypedAst.FormalParam(
+      TypedAst.Binder(fbind, Type.Unit),
+      Type.Unit,
+      TypeSource.Inferred,
+      SourceLocation.Unknown
+    ),
+      TypedAst.Expr.ApplyDef(
+        DefSymUse(defnSym, SourceLocation.Unknown),
+        TypedAst.Expr.Var(
+          fbind,
+          Type.Unit,
+          SourceLocation.Unknown
+        ) :: Nil,
+        Nil,
+        Type.mkArrowWithEffect(Type.Unit,  fnEff, Type.Unit, SourceLocation.Unknown),
+        Type.Unit,
+        fnEff,
+        SourceLocation.Unknown
+      ),
+      Type.mkArrowWithEffect(Type.Unit,  fnEff, Type.Unit, SourceLocation.Unknown),
+      SourceLocation.Unknown
+    )
+  }
+
+  private def createMkUnitTestCall(defnSym: DefnSym, defn: TypedAst.Def)(implicit flix: Flix) : TypedAst.Expr = {
+    val mkStringArg = (str: String) => TypedAst.Expr.Cst(Constant.Str(str), Type.Str, SourceLocation.Unknown)
+    val mkIntArg = (int: Int) => TypedAst.Expr.Cst(Constant.Int32(int), Type.Int32, SourceLocation.Unknown)
+    val (eff, symUseName) = if(eval(defn.spec.eff).unsafeGet.contains(Symbol.IO)) {
+      (Type.mkUnion(Type.IO, Type.Assert, SourceLocation.Unknown), "UnitTest.mkIOUnitTest")
+    } else {
+      (Type.Assert, "UnitTest.mkPureUnitTest")
+    }
+    val symUse = SymUse.DefSymUse(Symbol.mkDefnSym(symUseName), SourceLocation.Unknown)
+    TypedAst.Expr.ApplyDef(
+      targs = List(Type.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown)),
+      symUse = symUse,
+      exps = List(
+        mkStringArg(defnSym.toString),
+        mkStringArg(defnSym.loc.source.toString),
+        mkIntArg(defnSym.loc.sp1.lineOneIndexed),
+        mkIntArg(defnSym.loc.sp1.colOneIndexed),
+        mkIntArg(defnSym.loc.sp2.lineOneIndexed),
+        mkIntArg(defnSym.loc.sp2.colOneIndexed),
+        createFnArg(defnSym, eff)
+      ),
+      itpe = Type.mkPureUncurriedArrow(List(
+          Type.Str,
+          Type.Str,
+        Type.Int32,
+        Type.Int32,
+        Type.Int32,
+        Type.Int32,
+        Type.mkArrowWithEffect(Type.Unit, eff, Type.Unit, SourceLocation.Unknown)
+        ),
+        Type.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown),
+        SourceLocation.Unknown
+      ),
+      tpe = Type.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown),
+      eff = Type.Pure,
+      loc = SourceLocation.Unknown
+    )
+  }
+
+  private def createCallToGetTests(sym: Symbol.DefnSym)(implicit flix: Flix) : TypedAst.Expr = {
+    val symUse = SymUse.DefSymUse(sym, SourceLocation.Unknown)
+    TypedAst.Expr.ApplyDef(
+      targs = List(),
+      symUse = symUse,
+      exps =  List(TypedAst.Expr.Cst(Constant.Unit, Type.Unit, SourceLocation.Unknown)),
+      itpe = Type.mkPureUncurriedArrow(List(
+        Type.Unit,
+      ),
+        Type.mkVector(Type.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown), SourceLocation.Unknown),
+        SourceLocation.Unknown
+      ),
+      tpe = Type.mkVector(Type.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown), SourceLocation.Unknown),
+      eff = Type.Pure,
+      loc = SourceLocation.Unknown
+    )
+  }
+
+  private def createCombinedTestVector(tests: TypedAst.Expr, childrenGetTests: List[Symbol.DefnSym])(implicit flix: Flix) : TypedAst.Expr = {
+    val symUseFlatten = SymUse.DefSymUse(Symbol.mkDefnSym("Vector.flatten"), SourceLocation.Unknown)
+    val childrenTests = childrenGetTests.map(createCallToGetTests)
+    val allTests = tests :: childrenTests
+    val NestedVectorType = Type.mkVector(Type.mkVector(Type.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown), SourceLocation.Unknown), SourceLocation.Unknown)
+    val vectorToFlatten = TypedAst.Expr.VectorLit(
+      exps = allTests,
+      tpe = NestedVectorType,
+      eff = Type.Pure,
+      loc = SourceLocation.Unknown
+    )
+    TypedAst.Expr.ApplyDef(
+      targs = List(Type.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown)),
+      symUse = symUseFlatten,
+      exps = List(vectorToFlatten),
+      itpe = Type.mkPureUncurriedArrow(
+        List(NestedVectorType),
+        Type.mkVector(Type.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown), SourceLocation.Unknown),
+        SourceLocation.Unknown
+      ),
+      tpe = Type.mkVector(Type.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown), SourceLocation.Unknown),
+      eff = Type.Pure,
+      loc = SourceLocation.Unknown
+    )
+  }
+
+
+  private def introduceTests(root: TypedAst.Root)(implicit flix: Flix) : TypedAst.Root =  {
+    val tests : Map[Symbol.ModuleSym, Iterable[(Symbol.DefnSym, TypedAst.Def)]] =
+      root.defs.filter(_._2.spec.ann.isTest).groupBy(_._1.namespace).map {
+        case (ns, defns) => Symbol.mkModuleSym(ns) -> defns
+      }
+    val newGetTests = root.modules.m.collect {
+      case (msym, melements)  =>
+        val modTests = tests.getOrElse(msym, List())
+        val oldGetTests = melements.collectFirst {
+          case x: Symbol.DefnSym if x.text == "getTests" => x
+        }
+        if (msym.toString == "E2") {
+          println(msym.toString)
+          println(melements)
+        }
+        oldGetTests match {
+          case Some(test) =>
+            val oldGetTestsDef = root.defs(test)
+            val oldVec = oldGetTestsDef.exp.asInstanceOf[TypedAst.Expr.VectorLit]
+            val getTestsChildrenCalls = melements.collect {
+              case x: Symbol.ModuleSym =>
+                val mod = root.modules.get(x)
+                mod.collectFirst {
+                  case x: Symbol.DefnSym if x.text == "getTests" => x
+                }
+            }.flatten
+            val directTests = oldVec.copy(exps = modTests.map(t => createMkUnitTestCall(t._1, t._2)).toList)
+            Some(test -> oldGetTestsDef.copy(exp = createCombinedTestVector(directTests, getTestsChildrenCalls)))
+            // This will only be the case with modules that are not explicitly declared as such, like traits
+          case None =>
+            //println(msym)
+            //println(melements)
+            None
+        }
+
+    }.flatten
+    root.copy(defs = root.defs ++ newGetTests)
   }
 
   /**

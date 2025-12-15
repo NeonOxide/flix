@@ -48,10 +48,9 @@ object Namer {
 
       val units = ParOps.parMapValues(program.units)(visitUnit)
       val SymbolTable(symbols0, instances0, uses0) = units.values.foldLeft(SymbolTable.empty)(tableUnit)
-
       // TODO NS-REFACTOR remove use of NName
       val symbols = symbols0.map {
-        case (k, v) => Name.mkUnlocatedNName(k) -> v.m
+        case (k, v) => Name.mkUnlocatedNName(k) -> (v.m + ("getTests" -> (getTestFunction(k)::Nil)))
       }
       val instances = instances0.map {
         case (k, v) => Name.mkUnlocatedNName(k) -> v
@@ -62,6 +61,36 @@ object Namer {
       val errors = sctx.errors.asScala.toList
       (NamedAst.Root(symbols, instances, uses, units, program.mainEntryPoint, locations, program.availableClasses, program.tokens), errors)
     }
+  // symbols.get(Name.mkUnlocatedNName(List("Reflect")))
+  private def getTestFunction(module_name: List[String])(implicit flix: Flix): NamedAst.Declaration = {
+      val getTestFnName = "getTests"
+      val emptyVecBody = NamedAst.Declaration.Def(
+        sym = Symbol.mkDefnSym(Name.mkUnlocatedNName(module_name), Name.Ident(getTestFnName, SourceLocation.Unknown)),
+        spec = NamedAst.Spec(
+          doc = Doc(List.empty, SourceLocation.Unknown),
+          ann = Annotations(List.empty),
+          mod = Modifiers(List(Modifier.Public, Modifier.Synthetic)),
+          tparams = List.empty,
+          fparams = List(
+            NamedAst.FormalParam(
+              sym = Symbol.freshVarSym("_unit", BoundBy.FormalParam, SourceLocation.Unknown)(Scope.Top, flix),
+              tpe = Some(NamedAst.Type.Unit(SourceLocation.Unknown)),
+              loc = SourceLocation.Unknown
+            )),
+          retTpe = NamedAst.Type.Apply(
+            tpe1 = NamedAst.Type.Ambiguous(Name.mkQName("Vector", SourceLocation.Unknown), SourceLocation.Unknown),
+            tpe2 = NamedAst.Type.Ambiguous(Name.mkQName("UnitTest.UnitTest", SourceLocation.Unknown), SourceLocation.Unknown),
+            loc = SourceLocation.Unknown
+          ),
+          eff = None,
+          tconstrs = List.empty,
+          econstrs = List.empty
+        ),
+        exp = NamedAst.Expr.VectorLit(List(), SourceLocation.Unknown),
+        loc = SourceLocation.Unknown
+      )
+      emptyVecBody
+  }
 
   /**
     * Performs naming on the given compilation unit `unit` under the given (partial) program `prog0`.
@@ -97,8 +126,9 @@ object Namer {
       val ns = Name.NName(ns0.idents :+ ident, ident.loc)
       val usesAndImports = usesAndImports0.map(visitUseOrImport)
       val ds = decls.map(visitDecl(_, ns))
+      //val ds = getTestFunction(ident.name::Nil)::ds0
       val sym = new Symbol.ModuleSym(ns.parts, ModuleKind.Standalone)
-      NamedAst.Declaration.Namespace(sym, usesAndImports, ds, loc)
+      NamedAst.Declaration.Namespace(sym, usesAndImports, ds , loc)
   }
 
   /**
@@ -200,6 +230,7 @@ object Namer {
     case "BigInt" => true
     case "String" => true
     case "Regex" => true
+    case "getTests" => true
     case _ => false
   }
 

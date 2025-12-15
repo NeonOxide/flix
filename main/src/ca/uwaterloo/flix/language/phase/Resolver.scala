@@ -126,15 +126,15 @@ object Resolver {
   /**
     * Builds a symbol table from the compilation unit.
     */
-  private def tableUnit(unit: ResolvedAst.CompilationUnit): SymbolTable = unit match {
+  private def tableUnit(unit: ResolvedAst.CompilationUnit)(implicit flix: Flix): SymbolTable = unit match {
     case ResolvedAst.CompilationUnit(_, decls, _) => SymbolTable.traverse(decls)(tableDecl)
   }
 
   /**
     * Builds a symbol table from the declaration.
     */
-  private def tableDecl(decl: ResolvedAst.Declaration): SymbolTable = decl match {
-    case ResolvedAst.Declaration.Namespace(_, _, decls, _) => SymbolTable.traverse(decls)(tableDecl)
+  private def tableDecl(decl: ResolvedAst.Declaration)(implicit flix: Flix): SymbolTable = decl match {
+    case ResolvedAst.Declaration.Namespace(s, _, decls, _) => SymbolTable.traverse(decls)(tableDecl).addDef(getTestsFunction(s.ns))
     case trt: ResolvedAst.Declaration.Trait => SymbolTable.empty.addTrait(trt)
     case inst: ResolvedAst.Declaration.Instance => SymbolTable.empty.addInstance(inst)
     case defn: ResolvedAst.Declaration.Def => SymbolTable.empty.addDef(defn)
@@ -150,7 +150,35 @@ object Resolver {
     case ResolvedAst.Declaration.AssocTypeSig(_, _, sym, _, _, _, _) => throw InternalCompilerException(s"Unexpected declaration: $sym", sym.loc)
     case ResolvedAst.Declaration.AssocTypeDef(_, _, symUse, _, _, _) => throw InternalCompilerException(s"Unexpected declaration: $symUse", symUse.loc)
   }
-
+  private def getTestsFunction(module_name: List[String])(implicit flix: Flix): ResolvedAst.Declaration.Def = {
+    val getTestFnName = "getTests"
+    val emptyVecBody = ResolvedAst.Declaration.Def(
+      sym = Symbol.mkDefnSym(Name.mkUnlocatedNName(module_name), Name.Ident(getTestFnName, SourceLocation.Unknown)),
+      spec = ResolvedAst.Spec(
+        doc = Doc(List.empty, SourceLocation.Unknown),
+        ann = Annotations(List.empty),
+        mod = Modifiers(List(Modifier.Public, Modifier.Synthetic)),
+        tparams = List.empty,
+        fparams = List(
+          ResolvedAst.FormalParam(
+            sym = Symbol.freshVarSym("_unit", BoundBy.FormalParam, SourceLocation.Unknown)(Scope.Top, flix),
+            tpe = Some(UnkindedType.mkUnit(SourceLocation.Unknown)),
+            loc = SourceLocation.Unknown
+          )),
+        tpe = UnkindedType.Apply(
+          UnkindedType.Cst(TypeConstructor.Vector, SourceLocation.Unknown),
+          UnkindedType.Cst(TypeConstructor.Enum(Symbol.mkEnumSym("UnitTest.UnitTest"), Kind.Star), SourceLocation.Unknown),
+          SourceLocation.Unknown
+        ),
+        eff = None,
+        tconstrs = List.empty,
+        econstrs = List.empty
+      ),
+      exp = ResolvedAst.Expr.VectorLit(Nil, SourceLocation.Unknown),
+      loc = SourceLocation.Unknown
+    )
+    emptyVecBody
+  }
   /**
     * Semi-resolves the type aliases in the root.
     */
@@ -2316,7 +2344,7 @@ object Resolver {
   /**
     * Looks up the definition or signature with qualified name `qname` in the namespace `ns0`.
     */
-  private def lookupQName(qname: Name.QName, scp0: LocalScope, ns0: Name.NName, root: NamedAst.Root)(implicit sctx: SharedContext): ResolvedQName = {
+  private def lookupQName(qname: Name.QName, scp0: LocalScope, ns0: Name.NName, root: NamedAst.Root)(implicit sctx: SharedContext, flix: Flix): ResolvedQName = {
     // first look in the LocalScope
     val resolutions = tryLookupName(qname, scp0, ns0, root)
 
@@ -2357,10 +2385,40 @@ object Resolver {
       case Resolution.LocalDef(sym, fparams) :: _ => ResolvedQName.LocalDef(sym, fparams)
       case Resolution.Var(sym) :: _ => ResolvedQName.Var(sym)
       case _ =>
-        val error = ResolutionError.UndefinedName(qname, AnchorPosition.mkImportOrUseAnchor(ns0), scp0, qname.loc)
-        sctx.errors.add(error)
-        ResolvedQName.Error(error)
+
+          val error = ResolutionError.UndefinedName(qname, AnchorPosition.mkImportOrUseAnchor(ns0), scp0, qname.loc)
+          sctx.errors.add(error)
+          ResolvedQName.Error(error)
     }
+  }
+
+  private def getTestFunction_(ns: List[String])(implicit flix: Flix): NamedAst.Declaration.Def = {
+    val getTestFnName = "getTests"
+    NamedAst.Declaration.Def(
+      sym = Symbol.mkDefnSym(Name.mkUnlocatedNName(ns), Name.Ident(getTestFnName, SourceLocation.Unknown)),
+      spec = NamedAst.Spec(
+        doc = Doc(List.empty, SourceLocation.Unknown),
+        ann = Annotations(List.empty),
+        mod = Modifiers(List.empty),
+        tparams = List.empty,
+        fparams = List(
+          NamedAst.FormalParam(
+            sym = Symbol.freshVarSym("_unit", BoundBy.FormalParam, SourceLocation.Unknown)(Scope.Top, flix),
+            tpe = Some(NamedAst.Type.Unit(SourceLocation.Unknown)),
+            loc = SourceLocation.Unknown
+          )),
+        retTpe = NamedAst.Type.Apply(
+          tpe1 = NamedAst.Type.Ambiguous(Name.mkQName("Vector", SourceLocation.Unknown), SourceLocation.Unknown),
+          tpe2 = NamedAst.Type.Ambiguous(Name.mkQName("Int32", SourceLocation.Unknown), SourceLocation.Unknown),
+          loc = SourceLocation.Unknown
+        ),
+        eff = None,
+        tconstrs = List.empty,
+        econstrs = List.empty
+      ),
+      exp = NamedAst.Expr.VectorLit(List(), SourceLocation.Unknown),
+      loc = SourceLocation.Unknown
+    )
   }
 
   /**
